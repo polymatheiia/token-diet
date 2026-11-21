@@ -1,7 +1,7 @@
 {
   "name": "token-diet",
   "version": "0.3.0",
-  "description": "Keeps Claude Code sessions cheap: context and usage band with a burn-rate projection, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that still allows the handoff write, and Sonnet for subagents.",
+  "description": "Keeps Claude Code sessions cheap: context and usage band with burn-rate and weekly-pace projections, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that writes the handoff itself, a usage log that measures what the limit counts, and Sonnet for subagents.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "contextNudgeTokens": {
