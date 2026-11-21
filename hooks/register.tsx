@@ -24,6 +24,7 @@ const WRITES = new Set(['Write', 'Edit'])
 const HANDOFF_DIRS = ['handoffs', 'handoff']
 const ID_SUFFIX = /-[0-9a-f]{8}\.md$/
 const MIN = 60_000
+const WEEK = 7 * 24 * 60 * MIN
 // Burn rate: measured over at most this long, and only once it spans this much time and rise.
 const RATE_WINDOW_MIN = 15
 const RATE_MIN_SPAN_MIN = 3
@@ -60,6 +61,14 @@ const left = (iso: string | undefined, now: number) => {
   if (!iso) return ''
   const min = Math.max(0, Math.round((Date.parse(iso) - now) / MIN))
   return min >= 60 ? `${Math.floor(min / 60)}h${pad(min % 60)}` : `${min}m`
+}
+
+// The weekly percentage the window would end on at its average rate so far; null in the first
+// tenth of the window (too little to go on) and once it has reset.
+export const weekPace = (l: Limit, now: number) => {
+  if (l.resetsAt === undefined) return null
+  const elapsed = 1 - (Date.parse(l.resetsAt) - now) / WEEK
+  return elapsed >= 0.1 && elapsed <= 1 ? l.percentUsed / elapsed : null
 }
 
 const baseName = (path: string) => (path.split('/').pop() ?? path).toLowerCase()
@@ -381,13 +390,19 @@ export const register: Register = (on, options) => {
         </Text>
         {tracked(snap.limits)
           .filter(l => live(l, now))
-          .map(l => (
-            <Text key={l.kind} dimColor={limColor(l.percentUsed) === undefined} color={limColor(l.percentUsed)}>
-              {'  ·  '}
-              {WINDOWS[l.kind]} {Math.floor(l.percentUsed)}%
-              {l.kind === 'five_hour' ? ` → ${hhmm(l.resetsAt)} (${left(l.resetsAt, now)})` : ''}
-            </Text>
-          ))}
+          .map(l => {
+            // The week is over pace when it would pass 100% before its reset.
+            const pace = l.kind === 'seven_day' ? weekPace(l, now) : null
+            const color = limColor(l.percentUsed) ?? (pace !== null && pace >= 100 ? 'yellow' : undefined)
+            return (
+              <Text key={l.kind} dimColor={color === undefined} color={color}>
+                {'  ·  '}
+                {WINDOWS[l.kind]} {Math.floor(l.percentUsed)}%
+                {l.kind === 'five_hour' ? ` → ${hhmm(l.resetsAt)} (${left(l.resetsAt, now)})` : ''}
+                {pace !== null ? ` (pace ${Math.round(pace)}%)` : ''}
+              </Text>
+            )
+          })}
         {showEta && eta !== null ? (
           <Text color={eta.minutes <= o.runwayMinutes ? 'red' : 'yellow'}>
             {'  ·  '}

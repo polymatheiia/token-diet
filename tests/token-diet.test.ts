@@ -272,13 +272,21 @@ test('the band draws on terminal and desktop: projection while fresh, no window 
     expect(await ui.find({ type: 'Text', text: /ctx 230k/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /5h 62%/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /95% in 11m/ })).toBeDefined()
+    // 76 of the week's 168 hours are gone: 10% so far is 22% by the reset.
+    expect(await ui.find({ type: 'Text', text: /wk 10% \(pace 22%\)/ })).toBeDefined()
     await ui.unmount()
   }
+
+  // Over pace: 60% with 45% of the week gone would pass 100% before the reset.
+  await $.session.measure(measure(230_000, 62, 60))
+  const over = await $.ui.mount({ ...band, surface: 'terminal' })
+  expect(await over.find({ type: 'Text', text: /wk 60% \(pace 133%\)/ })).toBeDefined()
+  await over.unmount()
 
   await clock.set(Date.parse('2026-11-21T16:41:00Z'))
   const later = await $.ui.mount({ ...band, surface: 'terminal' })
   expect(await later.find({ type: 'Text', text: /ctx 230k/ })).toBeDefined()
-  expect(await later.find({ type: 'Text', text: /wk 10%/ })).toBeDefined()
+  expect(await later.find({ type: 'Text', text: /wk 60%/ })).toBeDefined()
   expect(await later.find({ type: 'Text', text: /5h/ })).toBeUndefined()
   expect(await later.find({ type: 'Text', text: /95% in/ })).toBeUndefined()
   await later.unmount()

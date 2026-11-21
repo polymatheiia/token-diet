@@ -4,7 +4,7 @@ A Claude Code mod that cuts the biggest token cost in long agentic sessions: **r
 
 ## What it does
 
-- **Band above the prompt**: `ctx 230k/1M · 5h 62% → 16:40 (2h05) · wk 41% · 95% in 12m`, turning yellow/red at the thresholds. The last part appears when the 5-hour window is burning fast enough to reach the hard limit before it resets.
+- **Band above the prompt**: `ctx 230k/1M · 5h 62% → 16:40 (2h05) · wk 41% (pace 87%) · 95% in 12m`, turning yellow/red at the thresholds. `pace` is the weekly percentage the week would end on at its average rate so far (yellow from 100%: it would run out before the reset; hidden in the first 17 hours of the week). The last part appears when the 5-hour window is burning fast enough to reach the hard limit before it resets.
 - **Context nudge**: each time context passes another 150k, a toast for you and a note to Claude (never shown in the transcript) to update the handoff and suggest `/clear`. From the second nudge on the note is firmer: start nothing new, hand off, `/clear` now.
 - **Spawn gate (300k)**: above this context size the main session cannot start agents until it has updated its handoff file with Write or Edit. It asks again after each further 150k. Subagents are not gated. `spawnGateTokens: 0` turns it off.
 - **Runway warning**: when the 5-hour window would reach the hard limit within 10 minutes at the measured burn rate (at least 3 points over 3 minutes), Claude is told to write the deliverable and the handoff now, whatever the percentage.
