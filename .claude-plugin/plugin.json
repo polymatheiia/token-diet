@@ -1,0 +1,47 @@
+{
+  "name": "token-diet",
+  "version": "0.1.0",
+  "description": "Keeps Claude Code sessions cheap: context-size and usage-limit band, handoff nudges, a 95% guard that still allows the handoff write, and Sonnet for general subagents.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "contextNudgeTokens": {
+      "type": "number",
+      "title": "Context nudge (tokens)",
+      "description": "Nudge to write the handoff and /clear each time context passes another multiple of this.",
+      "default": 150000
+    },
+    "softLimitPercent": {
+      "type": "number",
+      "title": "Soft limit (%)",
+      "description": "5-hour/weekly usage at which Claude is told to write the deliverable and handoff now.",
+      "default": 80
+    },
+    "hardLimitPercent": {
+      "type": "number",
+      "title": "Hard limit (%)",
+      "description": "5-hour/weekly usage at which tool calls are blocked, except reading and writing the handoff file.",
+      "default": 95
+    },
+    "handoffFile": {
+      "type": "string",
+      "title": "Handoff file",
+      "description": "Handoff file path, relative to the project folder.",
+      "default": "HANDOFF.md"
+    },
+    "subagentModel": {
+      "type": "string",
+      "title": "Subagent model",
+      "description": "Model forced on general-purpose/Explore/Plan subagents (and any asking for opus/fable) unless your last prompt names opus or fable. 'off' disables.",
+      "options": [
+        "sonnet",
+        "haiku",
+        "off"
+      ],
+      "default": "sonnet"
+    }
+  },
+  "license": "MIT",
+  "author": {
+    "name": "polymatheiia"
+  }
+}
