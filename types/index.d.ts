@@ -19,6 +19,12 @@ declare module 'claude-code' {
       eta: Eta | null
       /** This session's 8-hex tag, used in its handoff file name; '' until first needed. */
       sid: string
+      /** Tokens used since the last usage-log line, per model: input, output, cache read, 5m write, 1h write. */
+      spent: Record<string, number[]>
+      /** This session's usage-log file; '' until its first line. */
+      logPath: string
+      /** The window readings of the last usage-log line, to skip a line with no news. */
+      logged: string
     }
   }
 }

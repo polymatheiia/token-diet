@@ -2,6 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Limit, Snap } from '../types'
+import { addUsage, isEmpty, parseRows, report } from './usage'
+import type { Row, Spent } from './usage'
 
 const snapAtom = atom({ plugin: 'token-diet', key: 'snap' } as const, null)
 const notesAtom = atom({ plugin: 'token-diet', key: 'notes' } as const, [])
@@ -11,6 +13,9 @@ const handoffAtom = atom({ plugin: 'token-diet', key: 'handoff' } as const, null
 const samplesAtom = atom({ plugin: 'token-diet', key: 'samples' } as const, [])
 const etaAtom = atom({ plugin: 'token-diet', key: 'eta' } as const, null)
 const sidAtom = atom({ plugin: 'token-diet', key: 'sid' } as const, '')
+const spentAtom = atom({ plugin: 'token-diet', key: 'spent' } as const, {})
+const logPathAtom = atom({ plugin: 'token-diet', key: 'logPath' } as const, '')
+const loggedAtom = atom({ plugin: 'token-diet', key: 'logged' } as const, '')
 
 const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: 'wk' }
 const STRONG = /\b(opus|fable)\b/i
@@ -24,7 +29,8 @@ const WRITES = new Set(['Write', 'Edit'])
 const HANDOFF_DIRS = ['handoffs', 'handoff']
 const ID_SUFFIX = /-[0-9a-f]{8}\.md$/
 const MIN = 60_000
-const WEEK = 7 * 24 * 60 * MIN
+const DAY = 24 * 60 * MIN
+const WEEK = 7 * DAY
 // Burn rate: measured over at most this long, and only once it spans this much time and rise.
 const RATE_WINDOW_MIN = 15
 const RATE_MIN_SPAN_MIN = 3
@@ -35,6 +41,7 @@ type Options = {
   softLimitPercent: number
   hardLimitPercent: number
   handoffFile: string
+  usageLog: boolean
   subagentModel: string
   spawnGateTokens: number
   runwayMinutes: number
@@ -86,16 +93,20 @@ async function queue($: EngineInterface, note: string) {
   await update($, notesAtom, list => [...list, note])
 }
 
-// This session's own 8-hex tag (made once, kept in session state) and the project's handoffs folder,
-// if it has one. The tag in the file name is what keeps parallel sessions in one folder apart.
+// This session's own 8-hex tag, made once and kept in session state.
+async function tag($: EngineInterface) {
+  const id8 = await read($, sidAtom)
+  if (id8 !== '') return id8
+  const bytes = crypto.getRandomValues(new Uint8Array(4))
+  const made = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+  await update($, sidAtom, held => (held === '' ? made : held))
+  return read($, sidAtom)
+}
+
+// The tag and the project's handoffs folder, if it has one. The tag in the file name is what
+// keeps parallel sessions in one folder apart.
 async function locate($: EngineInterface) {
-  let id8 = await read($, sidAtom)
-  if (id8 === '') {
-    const bytes = crypto.getRandomValues(new Uint8Array(4))
-    const made = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-    await update($, sidAtom, held => (held === '' ? made : held))
-    id8 = await read($, sidAtom)
-  }
+  const id8 = await tag($)
   let dir = ''
   if (id8 !== '') {
     for (const d of HANDOFF_DIRS) {
@@ -131,6 +142,67 @@ async function isOwnHandoff($: EngineInterface, path: string, handoffFile: strin
 
 const tracked = (limits: Limit[]) => limits.filter(l => l.kind in WINDOWS)
 
+// The usage log lives beside the user's Claude Code configuration, one file per session, so
+// parallel sessions never write the same file and no project folder is touched.
+async function usageDir($: EngineInterface) {
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+  return `${config}/token-diet/usage`
+}
+
+// One line per measurement that has news: the two windows, the context size, and the tokens
+// every model call of this session (subagents included) used since the line before.
+async function logRow($: EngineInterface, snap: Snap, now: number) {
+  const five = snap.limits.find(l => l.kind === 'five_hour')
+  const wk = snap.limits.find(l => l.kind === 'seven_day')
+  const seen = `${five?.percentUsed}@${five?.resetsAt}|${wk?.percentUsed}@${wk?.resetsAt}`
+  if (isEmpty(await read($, spentAtom)) && seen === (await read($, loggedAtom))) return
+  let spent: Spent = {}
+  await update($, spentAtom, held => {
+    spent = held
+    return {}
+  })
+  await update($, loggedAtom, () => seen)
+  let path = await read($, logPathAtom)
+  if (path === '') {
+    path = `${await usageDir($)}/${ymd(now)}-${await tag($)}.jsonl`
+    await update($, logPathAtom, () => path)
+  }
+  let before = ''
+  try {
+    before = await $.fs.read(path)
+  } catch {
+    // Unreadable but there (over the read limit): leave it whole and carry on in a new file.
+    if (await $.fs.exists(path)) {
+      path = path.replace(/\.jsonl$/, `-${now}.jsonl`)
+      await update($, logPathAtom, () => path)
+    }
+  }
+  const row: Row = { t: now }
+  if (five !== undefined) row.five = [five.percentUsed, five.resetsAt ?? '']
+  if (wk !== undefined) row.wk = [wk.percentUsed, wk.resetsAt ?? '']
+  if (snap.tokens !== undefined) row.ctx = snap.tokens
+  if (!isEmpty(spent)) row.d = spent
+  await $.fs.write(path, `${before}${JSON.stringify(row)}\n`)
+}
+
+async function usageReport($: EngineInterface, days: number) {
+  const dir = await usageDir($)
+  const now = await $.clock.now()
+  let names: string[] = []
+  try {
+    names = (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= days * DAY).map(f => f.name)
+  } catch {}
+  const rows: Row[] = []
+  let files = 0
+  for (const name of names) {
+    try {
+      rows.push(...parseRows(await $.fs.read(`${dir}/${name}`)).filter(row => now - row.t <= days * DAY))
+      files += 1
+    } catch {}
+  }
+  return report(rows, files, days)
+}
+
 export const register: Register = (on, options) => {
   const o = options as unknown as Options
   const keep = (o.keepStrongFor ?? '')
@@ -152,6 +224,35 @@ export const register: Register = (on, options) => {
     return step - (n > 0 ? n / 3 : 50_000)
   }
 
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'token-diet-usage',
+      description: 'What the usage log says about how the 5-hour limit counts cache reads',
+      argumentHint: '[days]',
+    })
+    return next(e)
+  })
+
+  // Shown to the person only: the report costs no context.
+  on('command.run', { command: 'token-diet-usage' }, async ($, e) => {
+    const days = Number.parseInt(e.args, 10)
+    return { text: await usageReport($, days > 0 ? days : 7), isTextDisplayOnly: true }
+  })
+
+  // Every model call of the session, a subagent's too: its token counts go to the usage log.
+  if (o.usageLog !== false) {
+    on('turn.step', async function* ($, e, next) {
+      const ran = yield* next(e)
+      const usage = ran.usage
+      if (usage !== null) {
+        try {
+          await update($, spentAtom, held => addUsage(held, usage))
+        } catch {}
+      }
+      return ran
+    })
+  }
+
   on('session.measure', async ($, e, next) => {
     const snap: Snap = {
       tokens: e.context.tokens,
@@ -160,6 +261,11 @@ export const register: Register = (on, options) => {
     }
     await update($, snapAtom, () => snap)
     const now = await $.clock.now()
+    if (o.usageLog !== false) {
+      try {
+        await logRow($, snap, now)
+      } catch {}
+    }
 
     // Context nudge: once per multiple of the threshold; reset after /clear or compaction.
     const tokens = e.context.tokens ?? 0

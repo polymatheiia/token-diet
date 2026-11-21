@@ -1,10 +1,13 @@
 import type { UsageUnit } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
 const T0 = Date.parse('2026-11-21T12:00:00Z')
 const MIN = 60_000
 const why = (r: object) => String((r as { deny?: string; text?: string }).deny ?? (r as { text?: string }).text ?? '')
 const notes = (r: object) => ((r as { context?: readonly string[] }).context ?? []).join('\n')
+
+const slash = (command: string, args = '') => ({ command, args, origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 100 } })
 
 const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' as const } })
 
@@ -290,4 +293,123 @@ test('the band draws on terminal and desktop: projection while fresh, no window 
   expect(await later.find({ type: 'Text', text: /5h/ })).toBeUndefined()
   expect(await later.find({ type: 'Text', text: /95% in/ })).toBeUndefined()
   await later.unmount()
+})
+
+// A config folder in memory: what the plugin wrote, by path.
+const disk = (on: Parameters<TestBody>[1], files: Record<string, string> = {}) => {
+  on('env.get', (_, e) => ({ value: e.name === 'CLAUDE_CONFIG_DIR' ? '/cfg' : undefined }))
+  on('fs.exists', (_, e) => ({ value: e.path in files }))
+  on('fs.read', (_, e) => {
+    const text = files[e.path]
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('fs.write', (_, e) => {
+    files[e.path] = e.text
+    return { value: undefined }
+  })
+  on('fs.list', (_, e) => ({
+    value: Object.keys(files)
+      .filter(path => path.startsWith(`${e.path}/`))
+      .map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: files[path]?.length ?? 0, mtimeMs: T0, isLink: false })),
+  }))
+  return files
+}
+
+const stepUsage = (model: string, input: number, output: number, read: number, write1h: number) => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: read,
+  cache_creation_input_tokens: write1h,
+  ephemeral_5m_input_tokens: 0,
+  ephemeral_1h_input_tokens: write1h,
+  model,
+})
+
+test('each reading with news is logged with the tokens every model call used since the last one', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  const files = disk(on)
+  const calls = [stepUsage('claude-fable-5-2', 2, 300, 40_000, 12_000), stepUsage('claude-sonnet-5-5', 5, 50, 0, 30_000)]
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: calls[e.index] ?? null }
+  })
+  const step = async (index: number, agentId?: string) => {
+    for await (const _chunk of $.turn.step({ turnId: 't1', index, model: 'm', messageCount: 1, ...(agentId === undefined ? {} : { agentId }) })) void _chunk
+  }
+
+  await step(0)
+  await step(1, 'a1')
+  await $.session.measure(measure(40_000, 11))
+  const [path] = Object.keys(files)
+  expect(path).toMatch(/^\/cfg\/token-diet\/usage\/2026-11-21-[0-9a-f]{8}\.jsonl$/)
+  const first = JSON.parse(files[path ?? ''] ?? '')
+  expect(first).toEqual({
+    t: T0,
+    five: [11, '2026-11-21T16:40:00Z'],
+    wk: [10, '2026-11-25T08:00:00Z'],
+    ctx: 40_000,
+    d: { 'claude-fable-5-2': [2, 300, 40_000, 0, 12_000], 'claude-sonnet-5-5': [5, 50, 0, 0, 30_000] },
+  })
+
+  // Nothing spent and no window moved: no line. A window that moved: one more line, appended.
+  await clock.advance(MIN)
+  await $.session.measure(measure(40_000, 11))
+  await $.session.measure(measure(40_000, 12))
+  const lines = (files[path ?? ''] ?? '').trim().split('\n')
+  expect(lines.length).toBe(2)
+  expect(JSON.parse(lines[1] ?? '')).toEqual({ t: T0 + MIN, five: [12, '2026-11-21T16:40:00Z'], wk: [10, '2026-11-25T08:00:00Z'], ctx: 40_000 })
+})
+
+test('usageLog off writes nothing', { options: { usageLog: false } }, async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const files = disk(on)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  await $.session.measure(measure(40_000, 11))
+  expect(Object.keys(files)).toEqual([])
+})
+
+// Four 5-hour windows of six stretches each, across two session files, in which every point
+// costs half a dollar of fresh tokens or a dollar of cache reads (at Sonnet 5.5 list prices).
+const syntheticLog = () => {
+  const files: Record<string, string> = {}
+  for (let w = 0; w < 4; w++) {
+    const resets = new Date(T0 - (4 - w) * 5 * 60 * MIN).toISOString()
+    let t = Date.parse(resets) - 4 * 60 * MIN
+    let p = 3
+    const rows = [{ t, five: [p, resets] }]
+    for (let i = 0; i < 6; i++) {
+      const fresh = 2 + ((i * 7 + w * 3) % 5)
+      const read = 1 + ((i * 3 + w) % 4)
+      p += 2 * fresh + read
+      t += 20 * MIN
+      rows.push({ t, five: [p, resets], d: { 'claude-sonnet-5-5': [fresh * 500_000, 0, read * 10_000_000, 0, 0] } } as never)
+    }
+    const path = `/cfg/token-diet/usage/2026-11-2${w % 2}-0000000${w % 2}.jsonl`
+    files[path] = (files[path] ?? '') + rows.map(row => JSON.stringify(row)).join('\n') + '\n'
+  }
+  return files
+}
+
+test('the usage report gives the weight of cache reads once the log can carry one', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  disk(on, syntheticLog())
+  const full = await $.command.run(slash('token-diet-usage'))
+  expect(full.isTextDisplayOnly).toBe(true)
+  expect(full.text).toContain('2 session files')
+  expect(full.text).toContain('weighs cache reads: 0.50 ± 0.00 of their API price')
+  expect(full.text).toContain('from 24 stretches')
+  expect(full.text).toContain('another Claude Code profile')
+})
+
+test('a thin usage log is reported as inconclusive', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const all = syntheticLog()
+  const [path, text] = Object.entries(all)[0] ?? ['', '']
+  disk(on, { [path]: text.split('\n').slice(0, 5).join('\n') })
+  const thin = await $.command.run(slash('token-diet-usage', '3'))
+  expect(thin.text).toContain('last 3 days')
+  expect(thin.text).toContain('inconclusive')
+  expect(thin.text).not.toContain('of their API price')
 })

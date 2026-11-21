@@ -1,6 +1,6 @@
 {
   "name": "token-diet",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Keeps Claude Code sessions cheap: context and usage band with a burn-rate projection, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that still allows the handoff write, and Sonnet for subagents.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -27,6 +27,12 @@
       "title": "Handoff file",
       "description": "Handoff file path, relative to the project folder. Not used in a project that has a handoffs/ folder: there each session writes handoffs/<date>-<topic>-<session id>.md.",
       "default": "HANDOFF.md"
+    },
+    "usageLog": {
+      "type": "boolean",
+      "title": "Usage log",
+      "description": "Log each usage reading with the tokens used since the one before (counts only, no content) to token-diet/usage/ in your Claude Code config folder. /token-diet-usage reports what the log says about how the limit counts cache reads.",
+      "default": true
     },
     "subagentModel": {
       "type": "string",
