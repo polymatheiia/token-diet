@@ -300,6 +300,7 @@ export const register: Register = (on, options) => {
   // The automatic handoff in flight or done, by the windows over the limit: parallel tool calls
   // denied in one step wait for the one fork.
   let auto: { key: string; done: Promise<string> } | null = null
+  let logging: Promise<void> = Promise.resolve()
   // The main loop's last few tool calls, one line each: what a fork cannot see yet.
   const recent: string[] = []
   const naming = (path: string) => (path.includes('<topic>') ? ' (replace <topic> with a 2-4 word slug)' : '')
@@ -351,9 +352,9 @@ export const register: Register = (on, options) => {
     await update($, snapAtom, () => snap)
     const now = await $.clock.now()
     if (o.usageLog !== false) {
-      try {
-        await logRow($, snap, now)
-      } catch {}
+      // One line at a time: a second measurement waits for the first one's read and write.
+      logging = logging.then(() => logRow($, snap, now)).catch(() => {})
+      await logging
     }
 
     // Context nudge: once per multiple of the threshold; reset after /clear or compaction.

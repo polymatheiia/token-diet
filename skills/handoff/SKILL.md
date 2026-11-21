@@ -27,6 +27,6 @@ The line `[token-diet] This session's handoff file: …` at the end of this prom
 
 ## Resume (argument `resume [path]`)
 
-1. With a path: read that file. Without one: list the handoff files here (`HANDOFF.md`, or the files in `handoffs/` whose names end in an 8-character tag), newest first, show the user up to five with their Goal lines, and ask which one. Don't pick one yourself, and don't take the newest file in the folder for a handoff.
+1. With a path: read that file. Without one: list the handoff files here (`HANDOFF.md` and any `HANDOFF-<tag>.md` beside it, or the files in `handoffs/` whose names end in an 8-character tag), newest first, show the user up to five with their Goal lines, and ask which one. Don't pick one yourself, and don't take the newest file in the folder for a handoff.
 2. Check drift cheaply: `git status -sb`, `git log -3 --oneline` on the named branches, and whether anything under **In flight** has finished. Don't re-read files the handoff already summarises.
 3. Report in ≤5 lines: where things stand, any drift, the first next step. Then do it. Keep updating the same file from here on.
