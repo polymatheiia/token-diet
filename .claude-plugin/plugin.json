@@ -1,13 +1,13 @@
 {
   "name": "token-diet",
-  "version": "0.1.0",
-  "description": "Keeps Claude Code sessions cheap: context-size and usage-limit band, handoff nudges, a 95% guard that still allows the handoff write, and Sonnet for general subagents.",
+  "version": "0.2.0",
+  "description": "Keeps Claude Code sessions cheap: context and usage band with a burn-rate projection, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that still allows the handoff write, and Sonnet for subagents.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "contextNudgeTokens": {
       "type": "number",
       "title": "Context nudge (tokens)",
-      "description": "Nudge to write the handoff and /clear each time context passes another multiple of this.",
+      "description": "Nudge to write the handoff and /clear each time context passes another multiple of this; the second and later nudges are firmer.",
       "default": 150000
     },
     "softLimitPercent": {
@@ -25,19 +25,37 @@
     "handoffFile": {
       "type": "string",
       "title": "Handoff file",
-      "description": "Handoff file path, relative to the project folder.",
+      "description": "Handoff file path, relative to the project folder. Not used in a project that has a handoffs/ folder: there each session writes handoffs/<date>-<topic>-<session id>.md.",
       "default": "HANDOFF.md"
     },
     "subagentModel": {
       "type": "string",
       "title": "Subagent model",
-      "description": "Model forced on general-purpose/Explore/Plan subagents (and any asking for opus/fable) unless your last prompt names opus or fable. 'off' disables.",
+      "description": "Model forced on general-purpose/Explore/Plan/claude subagents, and on any subagent asking for opus/fable, unless your last prompt asks for opus or fable or keepStrongFor matches. 'off' disables.",
       "options": [
         "sonnet",
         "haiku",
         "off"
       ],
       "default": "sonnet"
+    },
+    "spawnGateTokens": {
+      "type": "number",
+      "title": "Spawn gate (tokens)",
+      "description": "Above this context size the main session cannot start agents until its handoff file is up to date. 0 turns the gate off.",
+      "default": 300000
+    },
+    "runwayMinutes": {
+      "type": "number",
+      "title": "Runway (minutes)",
+      "description": "Also warn when the 5-hour window would reach the hard limit within this many minutes at the current burn rate. 0 turns the warning off.",
+      "default": 10
+    },
+    "keepStrongFor": {
+      "type": "string",
+      "title": "Keep strong model for",
+      "description": "Comma-separated words; a subagent whose type or description contains one keeps the model it asked for (e.g. 'security, branch review').",
+      "default": ""
     }
   },
   "license": "MIT",
