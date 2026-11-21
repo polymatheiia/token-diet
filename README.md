@@ -13,8 +13,20 @@ A Claude Code mod that cuts the biggest token cost in long agentic sessions: **r
 
 All thresholds are options in `/config`: `contextNudgeTokens`, `softLimitPercent`, `hardLimitPercent`, `handoffFile`, `subagentModel` (`sonnet` | `haiku` | `off`).
 
-## Install from a folder
+## Install
 
-    claude --plugin-dir /path/to/token-diet
+At the prompt of a Claude Code terminal session:
 
-or add the folder to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of your settings.
+```
+/plugin install token-diet --marketplace polymatheiia/token-diet
+```
+
+Answer `y` to add the marketplace, then pick a scope. From a shell:
+
+```
+claude plugin install token-diet --marketplace polymatheiia/token-diet
+```
+
+In the desktop app: click + next to the prompt box → Plugins → Add marketplace `polymatheiia/token-diet` → Add plugin.
+
+For development, load a local checkout with `claude --plugin-dir /path/to/token-diet`.
