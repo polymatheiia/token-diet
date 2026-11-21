@@ -25,6 +25,8 @@ declare module 'claude-code' {
       logPath: string
       /** The window readings of the last usage-log line, to skip a line with no news. */
       logged: string
+      /** The automatic handoff at the hard limit: which windows it was for, and the file written ('' if none). */
+      auto: { key: string; path: string } | null
     }
   }
 }

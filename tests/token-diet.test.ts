@@ -296,9 +296,9 @@ test('the band draws on terminal and desktop: projection while fresh, no window 
 })
 
 // A config folder in memory: what the plugin wrote, by path.
-const disk = (on: Parameters<TestBody>[1], files: Record<string, string> = {}) => {
+const disk = (on: Parameters<TestBody>[1], files: Record<string, string> = {}, there?: RegExp) => {
   on('env.get', (_, e) => ({ value: e.name === 'CLAUDE_CONFIG_DIR' ? '/cfg' : undefined }))
-  on('fs.exists', (_, e) => ({ value: e.path in files }))
+  on('fs.exists', (_, e) => ({ value: e.path in files || (there?.test(e.path) ?? false) }))
   on('fs.read', (_, e) => {
     const text = files[e.path]
     if (text === undefined) throw new Error('ENOENT')
@@ -412,4 +412,147 @@ test('a thin usage log is reported as inconclusive', async ($, on) => {
   expect(thin.text).toContain('last 3 days')
   expect(thin.text).toContain('inconclusive')
   expect(thin.text).not.toContain('of their API price')
+})
+
+const HANDOFF_REPLY = [
+  'slug: Billing Export!',
+  '# Handoff: billing export (2026-11-21)',
+  '## Goal',
+  '- ship the export',
+  '## Done',
+  '- parser, commit abc1234',
+  '## In progress',
+  '- branch export-csv',
+  '## In flight',
+  'None',
+  '## Deliverables',
+  'None',
+  '## Decisions',
+  '- CSV only',
+  '## Next',
+  '1. run the tests',
+].join('\n')
+
+// Answers the fork the way a session does, and counts the forks.
+const forks = (on: Parameters<TestBody>[1], text: string) => {
+  const asked: { prompt: string; effort?: string }[] = []
+  on('session.model', () => ({ value: 'claude-fable-5-2' }))
+  on('model.fork', (_, e) => {
+    asked.push(e)
+    return { value: { isAnswered: true as const, text, usage: { input_tokens: 40, output_tokens: 400, cache_read_input_tokens: 200_000, cache_creation_input_tokens: 0 } } }
+  })
+  return asked
+}
+
+test('at the hard limit the plugin writes the handoff itself, once, into a file of its own', async ($, on) => {
+  const ran: string[] = []
+  mock.clock(on, { now: T0 })
+  const files = disk(on, {}, /(^|\/)handoffs$/)
+  const asked = forks(on, HANDOFF_REPLY)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', (_, e) => (ran.push(e.tool), { result: {} }))
+
+  await $.session.measure(measure(210_000, 96))
+  // Two tool calls of one step are both denied and share the one fork.
+  const [first, second] = await Promise.all([$.tool.call({ tool: 'Bash', command: 'ls' }), $.tool.call({ tool: 'Bash', command: 'pwd' })])
+  expect(asked.length).toBe(1)
+  expect(asked[0]?.effort).toBeUndefined()
+  expect(asked[0]?.prompt).toContain('## In flight')
+
+  const path = Object.keys(files).find(name => /handoffs\//.test(name)) ?? ''
+  expect(path).toMatch(/handoffs\/2026-11-21-billing-export-[0-9a-f]{8}\.md$/)
+  expect(files[path]).toContain('# Handoff: billing export')
+  expect(files[path]).toContain('## Next\n1. run the tests')
+  expect(files[path]).not.toContain('slug:')
+  expect(files[path]).toContain('Written by token-diet at the usage limit')
+  for (const denied of [first, second]) {
+    expect(why(denied)).toContain('token-diet has written this session')
+    expect(why(denied)).toMatch(/resume handoffs\/2026-11-21-billing-export-[0-9a-f]{8}\.md/)
+  }
+
+  // Later calls in the same window are denied without another fork; the file stays editable.
+  expect(why(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toContain('token-diet has written')
+  await $.tool.call({ tool: 'Edit', file_path: path, old_string: 'a', new_string: 'b' })
+  expect(asked.length).toBe(1)
+  expect(ran).toEqual(['Edit'])
+
+  // The fork's tokens are in the usage log.
+  await $.session.measure(measure(210_000, 97))
+  const log = Object.entries(files).find(([name]) => name.endsWith('.jsonl'))?.[1] ?? ''
+  expect(log).toContain('"claude-fable-5-2":[40,400,200000,0,0]')
+})
+
+test('a plain handoff file this session does not hold is left alone', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const files = disk(on, {}, /(^|\/)HANDOFF\.md$/)
+  forks(on, HANDOFF_REPLY)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+
+  await $.session.measure(measure(210_000, 96))
+  const denied = why(await $.tool.call({ tool: 'Bash', command: 'ls' }))
+  const written = Object.keys(files).filter(name => name.endsWith('.md'))
+  expect(written.length).toBe(1)
+  expect(written[0]).toMatch(/HANDOFF-[0-9a-f]{8}\.md$/)
+  expect(denied).toMatch(/resume HANDOFF-[0-9a-f]{8}\.md/)
+})
+
+test('a handoff this session wrote earlier is brought up to date in place', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const files = disk(on)
+  const asked = forks(on, HANDOFF_REPLY)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'Write') files[e.file_path] = e.content
+    return { result: {} }
+  })
+
+  await $.session.measure(measure(100_000, 50))
+  await $.tool.call({ tool: 'Write', file_path: '/repo/HANDOFF.md', content: '# Handoff: old notes' })
+  await $.tool.call({ tool: 'Bash', command: 'npm   test\n-- export' })
+  await $.session.measure(measure(210_000, 96))
+  expect(why(await $.tool.call({ tool: 'Bash', command: 'git push' }))).toContain('resume /repo/HANDOFF.md')
+  expect(asked[0]?.prompt).toContain('# Handoff: old notes')
+  // The fork is told the steps it cannot see yet, and which one never ran.
+  expect(asked[0]?.prompt).toContain('- Write: /repo/HANDOFF.md\n- Bash: npm test -- export\n- Bash: git push (blocked by the usage limit)')
+  expect(files['/repo/HANDOFF.md']).toContain('# Handoff: billing export')
+})
+
+test('a current handoff, a reply that is no handoff, or autoHandoff off: Claude is asked as before', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const files = disk(on)
+  const asked = forks(on, 'Sorry, here is a summary instead: all good.')
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+
+  // No handoff in the reply: nothing is written and the old instruction stands.
+  await $.session.measure(measure(210_000, 96))
+  expect(why(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toContain('If the handoff is not written yet, write it')
+  expect(asked.length).toBe(1)
+  expect(Object.keys(files).filter(name => name.endsWith('.md'))).toEqual([])
+
+  // The next 5-hour window: Claude wrote the handoff 10k tokens ago, so no fork is made.
+  const next = { ...measure(215_000, 50), rateLimits: [{ kind: 'five_hour', percentUsed: 50, resetsAt: '2026-11-21T21:40:00Z' }] }
+  await $.session.measure(next)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/HANDOFF.md', content: 'x' })
+  await $.session.measure({ ...next, context: { ...next.context, tokens: 225_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 96, resetsAt: '2026-11-21T21:40:00Z' }] })
+  expect(why(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toContain('Only the handoff file (/repo/HANDOFF.md)')
+  expect(asked.length).toBe(1)
+})
+
+test('autoHandoff off makes no fork', { options: { autoHandoff: false } }, async ($, on) => {
+  mock.clock(on, { now: T0 })
+  disk(on)
+  const asked = forks(on, HANDOFF_REPLY)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+
+  await $.session.measure(measure(210_000, 96))
+  expect(why(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toContain('If the handoff is not written yet, write it')
+  expect(asked.length).toBe(0)
 })

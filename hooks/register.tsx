@@ -16,6 +16,7 @@ const sidAtom = atom({ plugin: 'token-diet', key: 'sid' } as const, '')
 const spentAtom = atom({ plugin: 'token-diet', key: 'spent' } as const, {})
 const logPathAtom = atom({ plugin: 'token-diet', key: 'logPath' } as const, '')
 const loggedAtom = atom({ plugin: 'token-diet', key: 'logged' } as const, '')
+const autoAtom = atom({ plugin: 'token-diet', key: 'auto' } as const, null)
 
 const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: 'wk' }
 const STRONG = /\b(opus|fable)\b/i
@@ -35,12 +36,16 @@ const WEEK = 7 * DAY
 const RATE_WINDOW_MIN = 15
 const RATE_MIN_SPAN_MIN = 3
 const RATE_MIN_RISE = 3
+// A handoff written within this much context growth is current: the plugin does not write over it.
+const FRESH_TOKENS = 20_000
+const SECTIONS = ['Goal', 'Done', 'In progress', 'In flight', 'Deliverables', 'Decisions', 'Next']
 
 type Options = {
   contextNudgeTokens: number
   softLimitPercent: number
   hardLimitPercent: number
   handoffFile: string
+  autoHandoff: boolean
   usageLog: boolean
   subagentModel: string
   spawnGateTokens: number
@@ -142,6 +147,85 @@ async function isOwnHandoff($: EngineInterface, path: string, handoffFile: strin
 
 const tracked = (limits: Limit[]) => limits.filter(l => l.kind in WINDOWS)
 
+// What the fork is asked at the hard limit. No effort is named and haste is asked for in words,
+// so nothing moves ahead of the prompt and the conversation is read from the cache.
+export const handoffAsk = (date: string, existing: string, recent: string[] = []) =>
+  `[token-diet] The usage limit is reached and this session is about to be stopped. You have no tools here. ` +
+  `Answer straight away, without thinking it over, with the full text of this session's handoff file and nothing else. ` +
+  `A fresh session with no context must be able to continue from it alone. Under 60 lines, terse bullets, ` +
+  `concrete identifiers (paths, branches, commit SHAs, task numbers, exact commands).\n\n` +
+  `First line exactly: slug: <2-4 lowercase words joined by hyphens that name this work>\n` +
+  `Then the file, with exactly these headings:\n# Handoff: <topic> (${date})\n` +
+  SECTIONS.map(name => `## ${name}`).join('\n') +
+  `\n\nIn flight lists everything still running or owned elsewhere (background agents, peer sessions, wakeups, ` +
+  `long commands), or "None". Deliverables holds anything the user asked for that exists only in this conversation.` +
+  // A fork is sent the conversation as of the request before the last one: the newest step is missing from it.
+  (recent.length === 0
+    ? ''
+    : `\n\nThe conversation you see ends one step early. This session's most recent tool calls, oldest first ` +
+      `(count the ones you do not see as made; one marked blocked did not run):\n${recent.map(line => `- ${line}`).join('\n')}`) +
+  (existing === '' ? '' : `\n\nThe file as it stands; bring it up to date and keep what still holds:\n\n${existing.slice(0, 20_000)}`)
+
+// A tool call in one line, for the list above.
+const brief = (call: Record<string, unknown>) => {
+  const detail = ['command', 'file_path', 'description', 'pattern', 'skill'].map(key => call[key]).find(v => typeof v === 'string' && v !== '')
+  return typeof detail === 'string' ? `${String(call.tool)}: ${detail.replace(/\s+/g, ' ').slice(0, 160)}` : String(call.tool)
+}
+
+// The reply as a file: its slug line taken off, any code fence around it dropped. Null when it
+// is not a handoff (no Done and Next sections).
+export const handoffFrom = (reply: string) => {
+  let text = reply.trim().replace(/^```[a-z]*\n/i, '').replace(/\n```$/, '').trim()
+  const named = /^slug:\s*(.+)\n/i.exec(text)
+  if (named !== null) text = text.slice(named[0].length).trim()
+  if (!/^##\s*Done\b/im.test(text) || !/^##\s*Next\b/im.test(text)) return null
+  const slug = (named?.[1] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '')
+  return { slug: slug === '' ? 'session' : slug, text }
+}
+
+// At the hard limit the plugin writes the handoff itself: one tool-less fork of the conversation,
+// its reply saved as this session's handoff file. Resolves to the path written, or '' when nothing
+// was (already current, the fork gave no handoff, any failure): the caller then asks Claude for it.
+// It never rejects, and never writes a file this session does not hold or name by its own tag.
+async function autoHandoff($: EngineInterface, handoffFile: string, key: string, tokens: number, recent: string[]) {
+  try {
+    const done = await read($, autoAtom)
+    if (done !== null && done.key === key) return done.path
+    await update($, autoAtom, () => ({ key, path: '' }))
+    const held = await read($, handoffAtom)
+    if (held !== null && held.at > 0 && tokens - held.at <= FRESH_TOKENS) return ''
+    const now = await $.clock.now()
+    let existing = ''
+    if (held !== null) {
+      try {
+        existing = await $.fs.read(held.path)
+      } catch {}
+    }
+    const reply = await $.model.fork({ prompt: handoffAsk(ymd(now), existing, recent) })
+    if (!reply.isAnswered) return ''
+    const made = handoffFrom(reply.text)
+    if (made === null) return ''
+    let path = held?.path ?? ''
+    if (path === '') {
+      const { id8, dir } = await locate($)
+      if (dir !== '') path = `${dir}/${ymd(now)}-${made.slug}-${id8}.md`
+      // A plain handoff file that is already there may be another session's or older work's.
+      else path = (await $.fs.exists(handoffFile)) ? handoffFile.replace(/(\.md)?$/i, `-${id8}.md`) : handoffFile
+    }
+    await $.fs.write(path, `${made.text}\n\n_Written by token-diet at the usage limit (${hhmm(new Date(now).toISOString())}), from the conversation; not reviewed, and the last step before the limit may be missing._\n`)
+    await update($, handoffAtom, () => ({ path, at: tokens }))
+    await update($, autoAtom, () => ({ key, path }))
+    if (reply.usage !== undefined) {
+      const model = await $.session.model()
+      await update($, spentAtom, spent => addUsage(spent, { ...reply.usage, model }))
+    }
+    $.ui.toast(`Usage limit: handoff written to ${path}`)
+    return path
+  } catch {
+    return ''
+  }
+}
+
 // The usage log lives beside the user's Claude Code configuration, one file per session, so
 // parallel sessions never write the same file and no project folder is touched.
 async function usageDir($: EngineInterface) {
@@ -213,6 +297,11 @@ export const register: Register = (on, options) => {
   let toldDowngrade = false
   // Set while the handoff skill is in use and no file is held: the next tagged handoff read is a resume.
   let resuming = false
+  // The automatic handoff in flight or done, by the windows over the limit: parallel tool calls
+  // denied in one step wait for the one fork.
+  let auto: { key: string; done: Promise<string> } | null = null
+  // The main loop's last few tool calls, one line each: what a fork cannot see yet.
+  const recent: string[] = []
   const naming = (path: string) => (path.includes('<topic>') ? ' (replace <topic> with a 2-4 word slug)' : '')
 
   // The handoff must have been written at or after this context size before the main loop may
@@ -385,6 +474,11 @@ export const register: Register = (on, options) => {
     const main = e.agentId === undefined
     const snap = await read($, snapAtom)
     const path = 'file_path' in e && typeof e.file_path === 'string' ? e.file_path : ''
+    const line = brief(e as unknown as Record<string, unknown>)
+    if (main) {
+      recent.push(line)
+      if (recent.length > 6) recent.shift()
+    }
 
     // Hard guard: at the hard limit only the handoff file may be read or written.
     const hot = tracked(snap?.limits ?? []).filter(l => l.percentUsed >= o.hardLimitPercent)
@@ -397,6 +491,21 @@ export const register: Register = (on, options) => {
         const head = `[token-diet] Usage ${which} is at or above ${o.hardLimitPercent}%.`
         if (!main) {
           return { deny: `${head} Stop now: make no more tool calls and write no files. Return what you have so far as your final message.` }
+        }
+        if (o.autoHandoff !== false) {
+          const key = over.map(l => `${l.kind}@${l.resetsAt ?? ''}`).join('|')
+          const at = recent.lastIndexOf(line)
+          if (at >= 0) recent[at] = `${line} (blocked by the usage limit)`
+          if (auto === null || auto.key !== key) auto = { key, done: autoHandoff($, o.handoffFile, key, snap?.tokens ?? 0, [...recent]) }
+          const written = await auto.done
+          if (written !== '') {
+            return {
+              deny:
+                `${head} token-diet has written this session's handoff to ${written} from the conversation so far. ` +
+                `Make no more tool calls, and do not read or rewrite that file now. Tell the user in two lines: the limit ` +
+                `and when it resets, and that the work continues with /token-diet:handoff resume ${written}.`,
+            }
+          }
         }
         const file = await target($, o.handoffFile)
         return {

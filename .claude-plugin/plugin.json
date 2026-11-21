@@ -28,6 +28,12 @@
       "description": "Handoff file path, relative to the project folder. Not used in a project that has a handoffs/ folder: there each session writes handoffs/<date>-<topic>-<session id>.md.",
       "default": "HANDOFF.md"
     },
+    "autoHandoff": {
+      "type": "boolean",
+      "title": "Automatic handoff",
+      "description": "When the hard limit stops the main session mid-work and its handoff is not current, write the handoff file from one tool-less side call over the conversation instead of asking Claude to write it.",
+      "default": true
+    },
     "usageLog": {
       "type": "boolean",
       "title": "Usage log",
