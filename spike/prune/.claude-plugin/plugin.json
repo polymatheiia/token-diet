@@ -1,0 +1,1 @@
+{ "name": "prune-spike", "version": "0.0.1", "description": "Spike: answer session.compact with the transcript itself, old large tool results replaced by a stub." }
