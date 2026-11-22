@@ -68,6 +68,12 @@
       "title": "Keep strong model for",
       "description": "Comma-separated words; a subagent whose type or description contains one keeps the model it asked for (e.g. 'security, branch review').",
       "default": ""
+    },
+    "skillBodyMaxChars": {
+      "type": "number",
+      "title": "Skill text cap (chars)",
+      "description": "A skill whose text is longer than this is cut to its first this-many characters, with one line saying how much was cut and the skill file to Read for the rest. Applies to every load, not only the first. 0 turns the cap off.",
+      "default": 0
     }
   },
   "license": "MIT",

@@ -556,3 +556,28 @@ test('autoHandoff off makes no fork', { options: { autoHandoff: false } }, async
   expect(why(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toContain('If the handoff is not written yet, write it')
   expect(asked.length).toBe(0)
 })
+
+const skill = (text: string, extra: object = {}) => ({ skill: 'big-skill', text, frontmatter: {}, source: 'plugin' as const, pluginName: 'other', ...extra })
+
+test('skill text is left whole by default, whatever its length', async ($, on) => {
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  const long = 'x'.repeat(50_000)
+  expect((await $.skill.prompt(skill(long))).text).toBe(long)
+})
+
+test('skillBodyMaxChars cuts a longer skill text and names the file to read', { options: { skillBodyMaxChars: 100 } }, async ($, on) => {
+  on('skill.prompt', (_, e) => ({ text: e.text }))
+  const cut = (await $.skill.prompt(skill('x'.repeat(250), { path: '/s/big/SKILL.md' }))).text
+  expect(cut.startsWith('x'.repeat(100) + '\n')).toBe(true)
+  expect(cut).not.toContain('x'.repeat(101))
+  expect(cut).toContain('150 of 250 chars not shown')
+  expect(cut).toContain('Read /s/big/SKILL.md for the rest')
+
+  // A skill with no file on this machine gets the line without a path.
+  expect((await $.skill.prompt(skill('x'.repeat(250)))).text).not.toContain('Read ')
+
+  // Not longer than the cap, or token-diet's own: untouched.
+  expect((await $.skill.prompt(skill('x'.repeat(100)))).text).toBe('x'.repeat(100))
+  const own = await $.skill.prompt(skill('x'.repeat(250), { skill: 'token-diet:other', pluginName: 'token-diet' }))
+  expect(own.text).toBe('x'.repeat(250))
+})

@@ -51,6 +51,16 @@ type Options = {
   spawnGateTokens: number
   runwayMinutes: number
   keepStrongFor: string
+  skillBodyMaxChars: number
+}
+
+// A skill text longer than max chars, cut to its first max chars plus one line saying how much went
+// and, when the skill has a file, where to Read the rest.
+export const capSkill = (text: string, max: number, path?: string) => {
+  const keep = Math.floor(max)
+  if (!(keep > 0) || text.length <= keep) return text
+  const where = path === undefined ? '' : ` Read ${path} for the rest.`
+  return `${text.slice(0, keep)}\n\n[token-diet] Skill text cut: ${text.length - keep} of ${text.length} chars not shown.${where}`
 }
 
 export const k = (n: number) =>
@@ -462,10 +472,17 @@ export const register: Register = (on, options) => {
     return next({ ...e, context: [...(e.context ?? []), ...notes] })
   }).catch(($, e, next) => next(e))
 
-  // The handoff skill is told which file is this session's, so it never has to guess.
+  // The handoff skill is told which file is this session's, so it never has to guess; other skills'
+  // text is cut at skillBodyMaxChars when that is set.
   on('skill.prompt', async ($, e, next) => {
     const ran = await next(e)
-    if (e.pluginName !== 'token-diet' || !/(^|:)handoff$/.test(e.skill)) return ran
+    // token-diet's own skills are never cut. Every load is capped, not only the first: no
+    // skill.prompt input tells which conversation or subagent a load is for.
+    if (e.pluginName !== 'token-diet') {
+      const text = capSkill(ran.text, o.skillBodyMaxChars, e.path)
+      return text === ran.text ? ran : { text }
+    }
+    if (!/(^|:)handoff$/.test(e.skill)) return ran
     const path = await target($, o.handoffFile)
     resuming = (await read($, handoffAtom)) === null
     return { text: `${ran.text}\n\n[token-diet] This session's handoff file: ${path}${naming(path)}.` }
