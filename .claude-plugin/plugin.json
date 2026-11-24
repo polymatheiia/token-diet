@@ -1,7 +1,7 @@
 {
   "name": "token-diet",
-  "version": "0.4.0",
-  "description": "Keeps Claude Code sessions cheap: context and usage band with burn-rate and weekly-pace projections, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that writes the handoff itself, a usage log that measures what the limit counts, and Sonnet for subagents.",
+  "version": "0.5.0",
+  "description": "Keeps Claude Code sessions cheap: context and usage band with burn-rate and weekly-pace projections, escalating handoff nudges, a spawn gate for large contexts, a 95% guard that writes the handoff itself and reads other sessions' usage, a usage log that measures what the limit counts and the startup size, /token-diet:slim to cut what sessions load at start, and Sonnet for subagents.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "contextNudgeTokens": {
@@ -72,8 +72,20 @@
     "skillBodyMaxChars": {
       "type": "number",
       "title": "Skill text cap (chars)",
-      "description": "A skill whose text is longer than this is cut to its first this-many characters, with one line saying how much was cut and the skill file to Read for the rest. Applies to every load, not only the first. 0 turns the cap off.",
-      "default": 0
+      "description": "A skill whose text is longer than this is cut to its first this-many characters, with one line saying how much was cut and the skill file to Read for the rest. Applies to every load, not only the first. 0 turns the cap off. A skill with no file is never cut.",
+      "default": 30000
+    },
+    "startupWarnTokens": {
+      "type": "number",
+      "title": "Startup target (tokens)",
+      "description": "Show the startup size in yellow in the band, and flag the median in /token-diet-usage, when a session starts with more context than this (the system prompt, tools, skills and MCP servers before you type). 0 turns the warning off.",
+      "default": 35000
+    },
+    "crossSession": {
+      "type": "boolean",
+      "title": "Cross-session guard",
+      "description": "Near the hard limit, also take the highest reading from other sessions' usage logs (needs the usage log), as the shell guard usage-guard.sh did.",
+      "default": true
     }
   },
   "license": "MIT",

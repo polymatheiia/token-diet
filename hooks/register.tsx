@@ -17,6 +17,8 @@ const spentAtom = atom({ plugin: 'token-diet', key: 'spent' } as const, {})
 const logPathAtom = atom({ plugin: 'token-diet', key: 'logPath' } as const, '')
 const loggedAtom = atom({ plugin: 'token-diet', key: 'logged' } as const, '')
 const autoAtom = atom({ plugin: 'token-diet', key: 'auto' } as const, null)
+const startAtom = atom({ plugin: 'token-diet', key: 'start' } as const, 0)
+const advAtom = atom({ plugin: 'token-diet', key: 'adv' } as const, 0)
 
 const WINDOWS: Record<string, string> = { five_hour: '5h', seven_day: 'wk' }
 const STRONG = /\b(opus|fable)\b/i
@@ -52,6 +54,8 @@ type Options = {
   runwayMinutes: number
   keepStrongFor: string
   skillBodyMaxChars: number
+  startupWarnTokens: number
+  crossSession: boolean
 }
 
 // A skill text longer than max chars, cut to its first max chars plus one line saying how much went
@@ -59,8 +63,9 @@ type Options = {
 export const capSkill = (text: string, max: number, path?: string) => {
   const keep = Math.floor(max)
   if (!(keep > 0) || text.length <= keep) return text
-  const where = path === undefined ? '' : ` Read ${path} for the rest.`
-  return `${text.slice(0, keep)}\n\n[token-diet] Skill text cut: ${text.length - keep} of ${text.length} chars not shown.${where}`
+  // A skill with no file (a bundled one may have none) cannot be read back: its text stays whole.
+  if (path === undefined || path === '') return text
+  return `${text.slice(0, keep)}\n\n[token-diet] Skill text cut: ${text.length - keep} of ${text.length} chars not shown. Read ${path} for the rest.`
 }
 
 export const k = (n: number) =>
@@ -156,6 +161,18 @@ async function isOwnHandoff($: EngineInterface, path: string, handoffFile: strin
 }
 
 const tracked = (limits: Limit[]) => limits.filter(l => l.kind in WINDOWS)
+
+// One reading per window: a live one over a reset one, then the highest (another session may have
+// seen more of the shared account). The denial then names each window once, and the auto-handoff
+// key stays the same while the readings move.
+export const mergeLimits = (limits: Limit[], now: number) => {
+  const by = new Map<string, Limit>()
+  for (const l of limits) {
+    const held = by.get(l.kind)
+    if (held === undefined || (live(l, now) && (!live(held, now) || l.percentUsed > held.percentUsed))) by.set(l.kind, l)
+  }
+  return [...by.values()].sort((a, b) => a.kind.localeCompare(b.kind))
+}
 
 // What the fork is asked at the hard limit. No effort is named and haste is asked for in words,
 // so nothing moves ahead of the prompt and the conversation is read from the cache.
@@ -276,10 +293,45 @@ async function logRow($: EngineInterface, snap: Snap, now: number) {
   if (wk !== undefined) row.wk = [wk.percentUsed, wk.resetsAt ?? '']
   if (snap.tokens !== undefined) row.ctx = snap.tokens
   if (!isEmpty(spent)) row.d = spent
+  let adv = 0
+  await update($, advAtom, held => {
+    adv = held
+    return 0
+  })
+  if (adv > 0) row.adv = adv
+  const start = await read($, startAtom)
+  if (start > 0) row.start = start
+  try {
+    const usd = (await $.session.usage()).cost?.usd
+    if (typeof usd === 'number' && usd > 0) row.usd = Math.round(usd * 10_000) / 10_000
+  } catch {}
   await $.fs.write(path, `${before}${JSON.stringify(row)}\n`)
 }
 
-async function usageReport($: EngineInterface, days: number) {
+const FRESH_MS = 15 * MIN
+const CHECK_MS = 20_000
+
+// The newest reading of each other session's usage log, from the last 15 minutes and for a window
+// that has not reset: the shared account's figure, which this session's own may lag behind.
+async function otherLimits($: EngineInterface, own: string, now: number): Promise<Limit[]> {
+  const out: Limit[] = []
+  try {
+    const dir = await usageDir($)
+    for (const f of await $.fs.list(dir)) {
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || now - f.mtimeMs > FRESH_MS || `${dir}/${f.name}` === own) continue
+      try {
+        const row = parseRows(await $.fs.read(`${dir}/${f.name}`)).at(-1)
+        if (row === undefined || now - row.t > FRESH_MS) continue
+        for (const [kind, v] of [['five_hour', row.five], ['seven_day', row.wk]] as const) {
+          if (v !== undefined && Date.parse(v[1]) > now) out.push({ kind, percentUsed: v[0], resetsAt: v[1] })
+        }
+      } catch {}
+    }
+  } catch {}
+  return out
+}
+
+async function usageReport($: EngineInterface, days: number, warnStart: number) {
   const dir = await usageDir($)
   const now = await $.clock.now()
   let names: string[] = []
@@ -287,14 +339,17 @@ async function usageReport($: EngineInterface, days: number) {
     names = (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl') && now - f.mtimeMs <= days * DAY).map(f => f.name)
   } catch {}
   const rows: Row[] = []
+  const groups: Row[][] = []
   let files = 0
   for (const name of names) {
     try {
-      rows.push(...parseRows(await $.fs.read(`${dir}/${name}`)).filter(row => now - row.t <= days * DAY))
+      const own = parseRows(await $.fs.read(`${dir}/${name}`)).filter(row => now - row.t <= days * DAY)
+      rows.push(...own)
+      groups.push(own)
       files += 1
     } catch {}
   }
-  return report(rows, files, days)
+  return report(rows, files, days, groups, warnStart)
 }
 
 export const register: Register = (on, options) => {
@@ -311,6 +366,7 @@ export const register: Register = (on, options) => {
   // denied in one step wait for the one fork.
   let auto: { key: string; done: Promise<string> } | null = null
   let logging: Promise<void> = Promise.resolve()
+  let others: { at: number; limits: Limit[] } = { at: 0, limits: [] }
   // The main loop's last few tool calls, one line each: what a fork cannot see yet.
   const recent: string[] = []
   const naming = (path: string) => (path.includes('<topic>') ? ' (replace <topic> with a 2-4 word slug)' : '')
@@ -336,7 +392,7 @@ export const register: Register = (on, options) => {
   // Shown to the person only: the report costs no context.
   on('command.run', { command: 'token-diet-usage' }, async ($, e) => {
     const days = Number.parseInt(e.args, 10)
-    return { text: await usageReport($, days > 0 ? days : 7), isTextDisplayOnly: true }
+    return { text: await usageReport($, days > 0 ? days : 7, o.startupWarnTokens), isTextDisplayOnly: true }
   })
 
   // Every model call of the session, a subagent's too: its token counts go to the usage log.
@@ -347,6 +403,13 @@ export const register: Register = (on, options) => {
       if (usage !== null) {
         try {
           await update($, spentAtom, held => addUsage(held, usage))
+        } catch {}
+      }
+      // The advisor runs inside the request: its cost is in /cost, not in this step's usage.
+      const adv = (ran.serverToolUses ?? []).filter(u => u.name === 'advisor').length
+      if (adv > 0) {
+        try {
+          await update($, advAtom, held => held + adv)
         } catch {}
       }
       return ran
@@ -361,6 +424,14 @@ export const register: Register = (on, options) => {
     }
     await update($, snapAtom, () => snap)
     const now = await $.clock.now()
+    // What this session starts with: the smallest context seen (a /clear or compaction can lower it).
+    // No toast: every reading already holds the first prompt, so a big paste or a resume would warn
+    // falsely. The band and /token-diet-usage show it.
+    const seen = e.context.tokens ?? 0
+    if (seen > 0) {
+      const held = await read($, startAtom)
+      if (held === 0 || seen < held) await update($, startAtom, () => seen)
+    }
     if (o.usageLog !== false) {
       // One line at a time: a second measurement waits for the first one's read and write.
       logging = logging.then(() => logRow($, snap, now)).catch(() => {})
@@ -499,7 +570,15 @@ export const register: Register = (on, options) => {
     }
 
     // Hard guard: at the hard limit only the handoff file may be read or written.
-    const hot = tracked(snap?.limits ?? []).filter(l => l.percentUsed >= o.hardLimitPercent)
+    let limits = tracked(snap?.limits ?? [])
+    // Other sessions share the account's windows and may have seen a higher reading than this one's
+    // last response: near the limit, take the highest of them (what usage-guard.sh did).
+    if (o.crossSession !== false && limits.some(l => l.percentUsed >= o.hardLimitPercent - 5)) {
+      const at = await $.clock.now()
+      if (at - others.at > CHECK_MS) others = { at, limits: await otherLimits($, await read($, logPathAtom), at) }
+      limits = mergeLimits([...limits, ...tracked(others.limits)], at)
+    }
+    const hot = limits.filter(l => l.percentUsed >= o.hardLimitPercent)
     if (hot.length > 0) {
       const now = await $.clock.now()
       const over = hot.filter(l => live(l, now))
@@ -609,6 +688,8 @@ export const register: Register = (on, options) => {
     const eta = await read($, etaAtom)
 
     const tokens = snap.tokens ?? 0
+    const startTokens = await read($, startAtom)
+    const startOver = o.startupWarnTokens > 0 && startTokens > o.startupWarnTokens
     const ctxColor = tokens >= 2 * o.contextNudgeTokens ? 'red' : tokens >= o.contextNudgeTokens ? 'yellow' : undefined
     const limColor = (p: number) => (p >= o.hardLimitPercent ? 'red' : p >= o.softLimitPercent ? 'yellow' : undefined)
     // The projection is shown while fresh and only if the block would come before the reset.
@@ -621,6 +702,11 @@ export const register: Register = (on, options) => {
         <Text dimColor={ctxColor === undefined} color={ctxColor}>
           ctx {snap.tokens === undefined ? '–' : k(tokens)}/{k(snap.window)}
         </Text>
+        {startTokens > 0 ? (
+          <Text dimColor={!startOver} color={startOver ? 'yellow' : undefined}>
+            {'  ·  '}start {k(startTokens)}
+          </Text>
+        ) : null}
         {tracked(snap.limits)
           .filter(l => live(l, now))
           .map(l => {

@@ -351,6 +351,7 @@ test('each reading with news is logged with the tokens every model call used sin
     wk: [10, '2026-11-25T08:00:00Z'],
     ctx: 40_000,
     d: { 'claude-fable-5-2': [2, 300, 40_000, 0, 12_000], 'claude-sonnet-5-5': [5, 50, 0, 0, 30_000] },
+    start: 40_000,
   })
 
   // Nothing spent and no window moved: no line. A window that moved: one more line, appended.
@@ -359,7 +360,7 @@ test('each reading with news is logged with the tokens every model call used sin
   await $.session.measure(measure(40_000, 12))
   const lines = (files[path ?? ''] ?? '').trim().split('\n')
   expect(lines.length).toBe(2)
-  expect(JSON.parse(lines[1] ?? '')).toEqual({ t: T0 + MIN, five: [12, '2026-11-21T16:40:00Z'], wk: [10, '2026-11-25T08:00:00Z'], ctx: 40_000 })
+  expect(JSON.parse(lines[1] ?? '')).toEqual({ t: T0 + MIN, five: [12, '2026-11-21T16:40:00Z'], wk: [10, '2026-11-25T08:00:00Z'], ctx: 40_000, start: 40_000 })
 })
 
 test('usageLog off writes nothing', { options: { usageLog: false } }, async ($, on) => {
@@ -559,10 +560,13 @@ test('autoHandoff off makes no fork', { options: { autoHandoff: false } }, async
 
 const skill = (text: string, extra: object = {}) => ({ skill: 'big-skill', text, frontmatter: {}, source: 'plugin' as const, pluginName: 'other', ...extra })
 
-test('skill text is left whole by default, whatever its length', async ($, on) => {
+test('skill text is cut at 30000 chars by default, and only when its file can be read back', async ($, on) => {
   on('skill.prompt', (_, e) => ({ text: e.text }))
   const long = 'x'.repeat(50_000)
   expect((await $.skill.prompt(skill(long))).text).toBe(long)
+  const cut = (await $.skill.prompt(skill(long, { path: '/s/big/SKILL.md' }))).text
+  expect(cut).toContain('20000 of 50000 chars not shown')
+  expect((await $.skill.prompt(skill('x'.repeat(30_000), { path: '/s/big/SKILL.md' }))).text).toBe('x'.repeat(30_000))
 })
 
 test('skillBodyMaxChars cuts a longer skill text and names the file to read', { options: { skillBodyMaxChars: 100 } }, async ($, on) => {
@@ -573,11 +577,110 @@ test('skillBodyMaxChars cuts a longer skill text and names the file to read', { 
   expect(cut).toContain('150 of 250 chars not shown')
   expect(cut).toContain('Read /s/big/SKILL.md for the rest')
 
-  // A skill with no file on this machine gets the line without a path.
-  expect((await $.skill.prompt(skill('x'.repeat(250)))).text).not.toContain('Read ')
+  // A skill with no file cannot be read back: it is left whole.
+  expect((await $.skill.prompt(skill('x'.repeat(250)))).text).toBe('x'.repeat(250))
 
   // Not longer than the cap, or token-diet's own: untouched.
   expect((await $.skill.prompt(skill('x'.repeat(100)))).text).toBe('x'.repeat(100))
   const own = await $.skill.prompt(skill('x'.repeat(250), { skill: 'token-diet:other', pluginName: 'token-diet' }))
   expect(own.text).toBe('x'.repeat(250))
+})
+
+test('the session cost and the startup size are logged, and the report splits off what the loop did not spend', async ($, on) => {
+  const clock = mock.clock(on, { now: T0 })
+  const files = disk(on)
+  // A resumed session: /cost already holds $10 when this log starts, which is only the baseline.
+  let usd = 10
+  let advisor = false
+  on('session.usage', () => ({ value: { startedAt: T0, context: { tokens: 0 }, rateLimits: [], cost: { usd } } as never }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('turn.step', async function* (_, e) {
+    const server = advisor ? { serverToolUses: [{ id: 'a', name: 'advisor', input: {}, startedAt: T0, endedAt: T0 }] } : {}
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: stepUsage('claude-sonnet-5-5', 1_000_000, 0, 0, 0), ...server } as never
+  })
+  const step = async () => {
+    for await (const _chunk of $.turn.step({ turnId: 't', index: 0, model: 'm', messageCount: 1 })) void _chunk
+  }
+  await step()
+  await $.session.measure(measure(24_000, 11))
+  await clock.advance(MIN)
+  advisor = true
+  await step()
+  usd = 13.5
+  await $.session.measure(measure(90_000, 12))
+  // After a /clear the session is smaller than it started: the last line holds the smallest.
+  await clock.advance(MIN)
+  await $.session.measure(measure(20_000, 13))
+  const [path] = Object.keys(files)
+  const rows = (files[path ?? ''] ?? '').trim().split('\n').map(l => JSON.parse(l))
+  expect(rows[0].usd).toBe(10)
+  expect(rows[0].start).toBe(24_000)
+  expect(rows[1].adv).toBe(1)
+  expect(rows[2].start).toBe(20_000)
+  const report = (await $.command.run(slash('token-diet-usage'))).text ?? ''
+  // $2 of Sonnet 5.5 input in the loop after the baseline, $3.50 more by /cost: $1.50 (43%) beside it.
+  expect(report).toContain('/cost minus the logged loop: $1.50 of $3.50 (43%), 1 advisor call,')
+  expect(report).toContain('Startup context: median 20k')
+})
+
+test('the startup size shows in the band, yellow over the target, with no toast', { options: { startupWarnTokens: 30_000 } }, async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const toasts: string[] = []
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', (_, e) => (toasts.push(e.text), { value: undefined }))
+  await $.session.measure(measure(34_000, 5))
+  await $.session.measure(measure(60_000, 5))
+  expect(toasts.filter(t => t.includes('Startup')).length).toBe(0)
+  const band = { plugin: 'token-diet', component: 'AbovePrompt', surface: 'terminal', props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 4, bodyColumns: 100, scroll: { offset: 0, bodyRows: 20 }, view: {} } } as const
+  const ui = await $.ui.mount(band)
+  expect((await ui.find({ type: 'Text', text: /start 34k/ }))?.props.color).toBe('yellow')
+  await ui.unmount()
+})
+
+test('with no model calls logged the report still gives the startup size', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  disk(on, { '/cfg/token-diet/usage/2026-11-21-aaaaaaaa.jsonl': JSON.stringify({ t: T0 - MIN, ctx: 31_000, start: 31_000 }) + '\n' })
+  const report = (await $.command.run(slash('token-diet-usage'))).text ?? ''
+  expect(report).toContain('Startup context: median 31k')
+  expect(report).toContain('No model calls logged yet')
+})
+
+test('near the hard limit another session\'s higher reading blocks tool calls', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const resets = '2026-11-21T16:40:00Z'
+  const other = JSON.stringify({ t: T0 - MIN, five: [96, resets], wk: [10, '2026-11-25T08:00:00Z'] }) + '\n'
+  disk(on, { '/cfg/token-diet/usage/2026-11-21-aaaaaaaa.jsonl': other })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+  await $.session.measure(measure(50_000, 92))
+  const blocked = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(blocked.isError === true || blocked.deny !== undefined).toBe(true)
+})
+
+test('several sessions over the limit name each window once, at the highest reading', { options: { autoHandoff: false } }, async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const resets = '2026-11-21T16:40:00Z'
+  const row = (five: number) => JSON.stringify({ t: T0 - MIN, five: [five, resets], wk: [10, '2026-11-25T08:00:00Z'] }) + '\n'
+  disk(on, { '/cfg/token-diet/usage/2026-11-21-aaaaaaaa.jsonl': row(97), '/cfg/token-diet/usage/2026-11-21-bbbbbbbb.jsonl': row(96) })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+  await $.session.measure(measure(50_000, 95))
+  const text = why(await $.tool.call({ tool: 'Bash', command: 'ls' }))
+  expect(text).toContain('5h 97%')
+  expect(text.match(/5h /g)?.length).toBe(1)
+})
+
+test('crossSession off ignores other sessions', { options: { crossSession: false } }, async ($, on) => {
+  mock.clock(on, { now: T0 })
+  const other = JSON.stringify({ t: T0 - MIN, five: [96, '2026-11-21T16:40:00Z'] }) + '\n'
+  disk(on, { '/cfg/token-diet/usage/2026-11-21-aaaaaaaa.jsonl': other })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('tool.call', () => ({ result: {} }))
+  await $.session.measure(measure(50_000, 92))
+  const ok = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(ok.deny).toBeUndefined()
 })

@@ -27,6 +27,10 @@ declare module 'claude-code' {
       logged: string
       /** The automatic handoff at the hard limit: which windows it was for, and the file written ('' if none). */
       auto: { key: string; path: string } | null
+      /** Smallest context size seen in this session: what it started with; 0 before the first measurement. */
+      start: number
+      /** Advisor calls (a server tool) since the last usage-log line. */
+      adv: number
     }
   }
 }

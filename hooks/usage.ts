@@ -3,8 +3,13 @@
 /** Tokens of one model: input, output, cache read, 5-minute cache write, 1-hour cache write. */
 export type Counts = number[]
 export type Spent = Record<string, Counts>
-/** One log line: when, the two windows as [percent, reset time], context size, tokens since the line before. */
-export type Row = { t: number; five?: [number, string]; wk?: [number, string]; ctx?: number; d?: Spent }
+/**
+ * One log line: when, the two windows as [percent, reset time], context size, tokens since the line
+ * before, the session's cost so far in US dollars (/cost's figure: advisor and side calls included),
+ * the smallest context size seen so far (what the session started with), and the advisor calls
+ * since the line before.
+ */
+export type Row = { t: number; five?: [number, string]; wk?: [number, string]; ctx?: number; d?: Spent; usd?: number; start?: number; adv?: number }
 
 type ApiUsage = {
   input_tokens: number
@@ -46,6 +51,48 @@ export const dollars = (model: string, c: Counts): [number, number] => {
   const [, price, readX] = PRICES.find(([re]) => re.test(model)) ?? [null, 4, 0.05]
   const [input = 0, output = 0, read = 0, m5 = 0, h1 = 0] = c
   return [(price * (input + 5 * output + 1.25 * m5 + 2 * h1)) / 1e6, (price * readX * read) / 1e6]
+}
+
+/** API dollars of the model calls one log line counted, cache reads included. */
+const rowDollars = (row: Row) => Object.entries(row.d ?? {}).reduce((n, [model, c]) => n + dollars(model, c).reduce((a, b) => a + b, 0), 0)
+
+/**
+ * /cost's growth against what the loop's own model calls logged over the same lines, and the
+ * advisor calls among them. Each session's first cost reading is only the baseline (a resumed
+ * session's /cost may carry what came before it), and lines after its last reading are left out.
+ * Cost restarts at 0 on /clear, so a fall starts a new stretch.
+ */
+export const outside = (groups: Row[][]) => {
+  let cost = 0
+  let loop = 0
+  let adv = 0
+  for (const rows of groups) {
+    const first = rows.findIndex(r => r.usd !== undefined)
+    let end = -1
+    rows.forEach((r, i) => {
+      if (r.usd !== undefined) end = i
+    })
+    if (first < 0 || end <= first) continue
+    let last = rows[first]?.usd ?? 0
+    for (const r of rows.slice(first + 1, end + 1)) {
+      loop += rowDollars(r)
+      adv += r.adv ?? 0
+      if (r.usd === undefined) continue
+      cost += r.usd >= last ? r.usd - last : r.usd
+      last = r.usd
+    }
+  }
+  return { cost, loop, adv, rest: Math.max(0, cost - loop) }
+}
+
+/** The context size each session started with: its last line's, which holds the smallest seen. */
+export const startups = (groups: Row[][]) =>
+  groups.map(rows => [...rows].reverse().find(r => r.start !== undefined)?.start).filter((n): n is number => n !== undefined)
+
+const median = (list: number[]) => {
+  const s = [...list].sort((a, b) => a - b)
+  const m = s.length >> 1
+  return s.length % 2 === 1 ? (s[m] ?? 0) : ((s[m - 1] ?? 0) + (s[m] ?? 0)) / 2
 }
 
 export const parseRows = (text: string): Row[] => {
@@ -162,7 +209,7 @@ export const MAX_ERROR = 0.35
 const money = (n: number) => `$${n.toFixed(n >= 100 ? 0 : 2)}`
 
 /** The text of /token-diet-usage. */
-export const report = (rows: Row[], files: number, days: number): string => {
+export const report = (rows: Row[], files: number, days: number, groups: Row[][] = [], warnStart = 0): string => {
   const list = intervals(rows)
   let fresh = 0
   let read = 0
@@ -177,13 +224,31 @@ export const report = (rows: Row[], files: number, days: number): string => {
   }
   const total = fresh + read
   const lines = [`token-diet usage log: last ${days} days, ${files} session files, ${rows.length} readings.`]
-  if (total === 0) return `${lines[0]}\nNothing logged yet. The log fills as sessions run with this version.`
+  const out = outside(groups)
+  if (out.cost > 0) {
+    lines.push(
+      `/cost minus the logged loop: $${out.rest.toFixed(2)} of $${out.cost.toFixed(2)} (${Math.round((100 * out.rest) / out.cost)}%), ` +
+        `${out.adv} advisor call${out.adv === 1 ? '' : 's'}, from sessions that logged a cost. The rest is the advisor, summaries and side ` +
+        `calls, plus what /cost prices above this log's list prices (long-context premium, fast mode, search fees).`,
+    )
+  }
+  const starts = startups(groups)
+  if (starts.length > 0) {
+    const med = median(starts)
+    const warn = warnStart > 0 && med > warnStart ? ` over the ${Math.round(warnStart / 1000)}k target` : ''
+    lines.push(
+      `Startup context: median ${Math.round(med / 1000)}k, range ${Math.round(Math.min(...starts) / 1000)}k-${Math.round(Math.max(...starts) / 1000)}k over ${starts.length} sessions${warn}.`,
+    )
+  }
+  if (total === 0) return [...lines, 'No model calls logged yet. The log fills as sessions run with this version.'].join('\n')
   const models = Object.entries(byModel)
     .sort((x, y) => y[1] - x[1])
     .slice(0, 4)
     .map(([model, usd]) => `${model.replace(/^claude-/, '')} ${Math.round((100 * usd) / total)}%`)
     .join(', ')
-  lines.push(
+  lines.splice(
+    1,
+    0,
     `Spent, at API list prices (a common scale, not a bill): ${money(total)}. ` +
       `Cache reads ${Math.round((100 * read) / total)}%, everything else ${Math.round((100 * fresh) / total)}%. By model: ${models}.`,
   )
