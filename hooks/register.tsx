@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Limit, Snap } from '../types'
+import { baseName, brief, HANDOFF_DIRS, handoffAsk, handoffFrom, ID_SUFFIX, isHandoffPath } from './handoff'
 import { addUsage, isEmpty, parseRows, report } from './usage'
 import type { Row, Spent } from './usage'
 
@@ -29,8 +30,6 @@ const wantsStrong = (text: string) => STRONG.test(text.replace(NEGATED, ' '))
 const DOWNGRADE_TYPES = new Set(['general-purpose', 'Explore', 'Plan', 'claude'])
 const READS_AND_WRITES = new Set(['Read', 'Write', 'Edit'])
 const WRITES = new Set(['Write', 'Edit'])
-const HANDOFF_DIRS = ['handoffs', 'handoff']
-const ID_SUFFIX = /-[0-9a-f]{8}\.md$/
 const MIN = 60_000
 const DAY = 24 * 60 * MIN
 const WEEK = 7 * DAY
@@ -40,7 +39,6 @@ const RATE_MIN_SPAN_MIN = 3
 const RATE_MIN_RISE = 3
 // A handoff written within this much context growth is current: the plugin does not write over it.
 const FRESH_TOKENS = 20_000
-const SECTIONS = ['Goal', 'Done', 'In progress', 'In flight', 'Deliverables', 'Decisions', 'Next']
 
 type Options = {
   contextNudgeTokens: number
@@ -96,14 +94,6 @@ export const weekPace = (l: Limit, now: number) => {
   if (l.resetsAt === undefined) return null
   const elapsed = 1 - (Date.parse(l.resetsAt) - now) / WEEK
   return elapsed >= 0.1 && elapsed <= 1 ? l.percentUsed / elapsed : null
-}
-
-const baseName = (path: string) => (path.split('/').pop() ?? path).toLowerCase()
-
-export const isHandoffPath = (path: string, handoffFile: string) => {
-  const base = baseName(handoffFile)
-  const p = path.toLowerCase()
-  return p.endsWith(`/${base}`) || p === base || /(^|\/)[^/]*handoff[^/]*\.md$/.test(p) || /(^|\/)handoffs?\/[^/]+\.md$/.test(p)
 }
 
 // A window that has already reset no longer counts, whatever the last reading said.
@@ -172,42 +162,6 @@ export const mergeLimits = (limits: Limit[], now: number) => {
     if (held === undefined || (live(l, now) && (!live(held, now) || l.percentUsed > held.percentUsed))) by.set(l.kind, l)
   }
   return [...by.values()].sort((a, b) => a.kind.localeCompare(b.kind))
-}
-
-// What the fork is asked at the hard limit. No effort is named and haste is asked for in words,
-// so nothing moves ahead of the prompt and the conversation is read from the cache.
-export const handoffAsk = (date: string, existing: string, recent: string[] = []) =>
-  `[token-diet] The usage limit is reached and this session is about to be stopped. You have no tools here. ` +
-  `Answer straight away, without thinking it over, with the full text of this session's handoff file and nothing else. ` +
-  `A fresh session with no context must be able to continue from it alone. Under 60 lines, terse bullets, ` +
-  `concrete identifiers (paths, branches, commit SHAs, task numbers, exact commands).\n\n` +
-  `First line exactly: slug: <2-4 lowercase words joined by hyphens that name this work>\n` +
-  `Then the file, with exactly these headings:\n# Handoff: <topic> (${date})\n` +
-  SECTIONS.map(name => `## ${name}`).join('\n') +
-  `\n\nIn flight lists everything still running or owned elsewhere (background agents, peer sessions, wakeups, ` +
-  `long commands), or "None". Deliverables holds anything the user asked for that exists only in this conversation.` +
-  // A fork is sent the conversation as of the request before the last one: the newest step is missing from it.
-  (recent.length === 0
-    ? ''
-    : `\n\nThe conversation you see ends one step early. This session's most recent tool calls, oldest first ` +
-      `(count the ones you do not see as made; one marked blocked did not run):\n${recent.map(line => `- ${line}`).join('\n')}`) +
-  (existing === '' ? '' : `\n\nThe file as it stands; bring it up to date and keep what still holds:\n\n${existing.slice(0, 20_000)}`)
-
-// A tool call in one line, for the list above.
-const brief = (call: Record<string, unknown>) => {
-  const detail = ['command', 'file_path', 'description', 'pattern', 'skill'].map(key => call[key]).find(v => typeof v === 'string' && v !== '')
-  return typeof detail === 'string' ? `${String(call.tool)}: ${detail.replace(/\s+/g, ' ').slice(0, 160)}` : String(call.tool)
-}
-
-// The reply as a file: its slug line taken off, any code fence around it dropped. Null when it
-// is not a handoff (no Done and Next sections).
-export const handoffFrom = (reply: string) => {
-  let text = reply.trim().replace(/^```[a-z]*\n/i, '').replace(/\n```$/, '').trim()
-  const named = /^slug:\s*(.+)\n/i.exec(text)
-  if (named !== null) text = text.slice(named[0].length).trim()
-  if (!/^##\s*Done\b/im.test(text) || !/^##\s*Next\b/im.test(text)) return null
-  const slug = (named?.[1] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '')
-  return { slug: slug === '' ? 'session' : slug, text }
 }
 
 // At the hard limit the plugin writes the handoff itself: one tool-less fork of the conversation,
